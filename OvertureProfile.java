@@ -7,8 +7,15 @@ import com.onthegomap.planetiler.util.Glob;
 import com.onthegomap.planetiler.reader.parquet.ParquetFeature;
 import org.apache.parquet.schema.MessageType;
 
+import com.fasterxml.jackson.dataformat.csv.CsvMapper;
+import com.fasterxml.jackson.dataformat.csv.CsvSchema;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class OvertureProfile implements Profile {
 
@@ -16,8 +23,48 @@ public class OvertureProfile implements Profile {
         void processFeature(SourceFeature source, FeatureCollector features);
     }
 
-    public OvertureProfile() {
+    private final Map<String, String> gersToParcelnumb;
+    private final Map<String, String[]> parcelnumbToZoning;
 
+    public OvertureProfile() {
+        gersToParcelnumb = loadBridge(Path.of("dallas_bridge.csv"));
+        parcelnumbToZoning = loadParcels(Path.of("tx_dallas.csv"));
+    }
+
+    private static Map<String, String> loadBridge(Path path) {
+        Map<String, String> map = new HashMap<>();
+        var mapper = new CsvMapper();
+        var schema = CsvSchema.emptySchema().withHeader();
+        try (var it = mapper.readerFor(Map.class).with(schema).readValues(path.toFile())) {
+            while (it.hasNext()) {
+                @SuppressWarnings("unchecked")
+                Map<String, String> row = (Map<String, String>) it.next();
+                map.put(row.get("gers_id"), row.get("ll_uuid"));
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return map;
+    }
+
+    private static Map<String, String[]> loadParcels(Path path) {
+        Map<String, String[]> map = new HashMap<>();
+        var mapper = new CsvMapper();
+        var schema = CsvSchema.emptySchema().withHeader();
+        try (var it = mapper.readerFor(Map.class).with(schema).readValues(path.toFile())) {
+            while (it.hasNext()) {
+                @SuppressWarnings("unchecked")
+                Map<String, String> row = (Map<String, String>) it.next();
+                String zoningType = row.getOrDefault("zoning_type", "");
+                String zoningSubtype = row.getOrDefault("zoning_subtype", "");
+                if (!zoningType.isEmpty() || !zoningSubtype.isEmpty()) {
+                    map.put(row.get("ll_uuid"), new String[]{zoningType, zoningSubtype});
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return map;
     }
 
     protected static void addFullTags(SourceFeature source, FeatureCollector.Feature feature, int minZoomToShowAlways) {
@@ -25,17 +72,9 @@ public class OvertureProfile implements Profile {
             MessageType schema = pf.parquetSchema();
             for (var field : schema.getFields()) {
                 var name = field.getName();
-                if (!pf.hasTag(name)) continue;
-                if (name.equals("bbox") || name.equals("geometry")) continue;
                 if (name.equals("names")) {
                     var primaryName = pf.getStruct("names").get("primary");
                     feature.setAttrWithMinSize("@name", primaryName, 16, 0, minZoomToShowAlways);
-                }
-                if (field.isPrimitive()) {
-                    feature.inheritAttrFromSource(name);
-                    feature.setAttrWithMinSize(name, source.getTag(name), 16, 0, minZoomToShowAlways);
-                } else {
-                    feature.setAttrWithMinSize(name, source.getStruct(name).asJson(), 16, 0, minZoomToShowAlways);
                 }
             }
         }
@@ -53,6 +92,18 @@ public class OvertureProfile implements Profile {
         String layer = source.getSourceLayer();
         var point = features.point(layer).setMinZoom(10);
         OvertureProfile.addFullTags(source, point, 10);
+
+        String id = source.getString("id");
+        if (id != null) {
+            String llUuid = gersToParcelnumb.get(id);
+            if (llUuid != null) {
+                String[] zoning = parcelnumbToZoning.get(llUuid);
+                if (zoning != null) {
+                    point.setAttr("zoning_type", zoning[0]);
+                    point.setAttr("zoning_subtype", zoning[1]);
+                }
+            }
+        }
     }
 
     @Override
