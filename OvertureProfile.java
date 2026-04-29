@@ -7,8 +7,11 @@ import com.onthegomap.planetiler.util.Glob;
 import com.onthegomap.planetiler.reader.parquet.ParquetFeature;
 import org.apache.parquet.schema.MessageType;
 
-import com.fasterxml.jackson.dataformat.csv.CsvMapper;
-import com.fasterxml.jackson.dataformat.csv.CsvSchema;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.io.ColumnIOFactory;
+import org.apache.parquet.io.LocalInputFile;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -27,43 +30,45 @@ public class OvertureProfile implements Profile {
     private final Map<String, String[]> parcelnumbToZoning;
 
     public OvertureProfile() {
-        gersToParcelnumb = loadBridge(Path.of("dallas_bridge.csv"));
-        parcelnumbToZoning = loadParcels(Path.of("tx_dallas.csv"));
+        gersToParcelnumb = loadBridge(Path.of("dallas_bridge.parquet"));
+        parcelnumbToZoning = loadParcels(Path.of("tx_dallas.parquet"));
     }
 
-    private static Map<String, String> loadBridge(Path path) {
-        Map<String, String> map = new HashMap<>();
-        var mapper = new CsvMapper();
-        var schema = CsvSchema.emptySchema().withHeader();
-        try (var it = mapper.readerFor(Map.class).with(schema).readValues(path.toFile())) {
-            while (it.hasNext()) {
-                @SuppressWarnings("unchecked")
-                Map<String, String> row = (Map<String, String>) it.next();
-                map.put(row.get("gers_id"), row.get("ll_uuid"));
-            }
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-        return map;
+    private static String getStringOrEmpty(Group group, String field) {
+        return group.getFieldRepetitionCount(field) > 0 ? group.getString(field, 0) : "";
     }
 
-    private static Map<String, String[]> loadParcels(Path path) {
-        Map<String, String[]> map = new HashMap<>();
-        var mapper = new CsvMapper();
-        var schema = CsvSchema.emptySchema().withHeader();
-        try (var it = mapper.readerFor(Map.class).with(schema).readValues(path.toFile())) {
-            while (it.hasNext()) {
-                @SuppressWarnings("unchecked")
-                Map<String, String> row = (Map<String, String>) it.next();
-                String zoningType = row.getOrDefault("zoning_type", "");
-                String zoningSubtype = row.getOrDefault("zoning_subtype", "");
-                if (!zoningType.isEmpty() || !zoningSubtype.isEmpty()) {
-                    map.put(row.get("ll_uuid"), new String[]{zoningType, zoningSubtype});
+    private static void readParquet(Path path, java.util.function.Consumer<Group> consumer) {
+        try (var fileReader = ParquetFileReader.open(new LocalInputFile(path))) {
+            var schema = fileReader.getFooter().getFileMetaData().getSchema();
+            var columnIO = new ColumnIOFactory().getColumnIO(schema);
+            org.apache.parquet.column.page.PageReadStore pages;
+            while ((pages = fileReader.readNextRowGroup()) != null) {
+                var recordReader = columnIO.getRecordReader(pages, new GroupRecordConverter(schema));
+                for (long i = 0; i < pages.getRowCount(); i++) {
+                    consumer.accept(recordReader.read());
                 }
             }
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    private static Map<String, String> loadBridge(Path path) {
+        Map<String, String> map = new HashMap<>();
+        readParquet(path, row -> map.put(row.getString("gers_id", 0), row.getString("ll_uuid", 0)));
+        return map;
+    }
+
+    private static Map<String, String[]> loadParcels(Path path) {
+        Map<String, String[]> map = new HashMap<>();
+        readParquet(path, row -> {
+            String zoningType = getStringOrEmpty(row, "zoning_type");
+            String zoningSubtype = getStringOrEmpty(row, "zoning_subtype");
+            if (!zoningType.isEmpty() || !zoningSubtype.isEmpty()) {
+                map.put(row.getString("ll_uuid", 0), new String[]{zoningType, zoningSubtype});
+            }
+        });
         return map;
     }
 
@@ -93,10 +98,17 @@ public class OvertureProfile implements Profile {
         var point = features.point(layer).setMinZoom(10);
         OvertureProfile.addFullTags(source, point, 10);
 
+        var confidence = source.getTag("confidence");
+        if (confidence != null) {
+            point.setAttr("confidence", confidence);
+        }
+
         String id = source.getString("id");
         if (id != null) {
+            point.setAttr("gers_id", id);
             String llUuid = gersToParcelnumb.get(id);
             if (llUuid != null) {
+                point.setAttr("ll_uuid", llUuid);
                 String[] zoning = parcelnumbToZoning.get(llUuid);
                 if (zoning != null) {
                     point.setAttr("zoning_type", zoning[0]);
